@@ -1,0 +1,23 @@
+# Stage 1 — builder
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Stage 2 — runtime
+FROM python:3.11-slim
+
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+COPY ./app /app/app
+COPY ./templates /app/templates
+COPY ./alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+
+RUN adduser --disabled-password --no-create-home appuser
+USER appuser
+
+# CMD is overridden per-service in docker-compose.yml
