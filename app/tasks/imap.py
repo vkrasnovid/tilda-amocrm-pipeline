@@ -6,7 +6,7 @@ from sqlalchemy import insert, select, update
 
 from app.celery_app import celery_app
 from app.db.models import email_events_table, imap_poll_log_table, leads_table
-from app.db.session import get_db
+from app.db.session import get_sync_session
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +19,10 @@ def imap_poll_inbox(self) -> None:
     try:
         messages_checked, matches_found = asyncio.run(_imap_poll_async())
         logger.info("[task.imap] Checked %d messages, found %d matches", messages_checked, matches_found)
-        asyncio.run(_log_poll(polled_at, messages_checked, matches_found, error=None))
+        _log_poll(polled_at, messages_checked, matches_found, error=None)
     except Exception as exc:
         logger.warning("[task.imap] Poll error: %s", exc, exc_info=True)
-        asyncio.run(_log_poll(polled_at, 0, 0, error=str(exc)))
+        _log_poll(polled_at, 0, 0, error=str(exc))
         if self.request.retries < self.max_retries:
             raise self.retry(exc=exc, countdown=60)
         raise
@@ -37,7 +37,7 @@ async def _imap_poll_async() -> tuple[int, int]:
         matches_found = 0
 
         for sender_email, uid in zip(sender_emails, uids):
-            matched = await _process_sender(sender_email)
+            matched = _process_sender(sender_email)
             if matched:
                 matches_found += 1
 
@@ -46,10 +46,10 @@ async def _imap_poll_async() -> tuple[int, int]:
     return messages_checked, matches_found
 
 
-async def _process_sender(sender_email: str) -> bool:
+def _process_sender(sender_email: str) -> bool:
     """Check if sender matches an active lead; stop chain if so. Returns True if matched."""
-    async with get_db() as conn:
-        result = await conn.execute(
+    with get_sync_session() as conn:
+        result = conn.execute(
             select(leads_table.c.id, leads_table.c.name, leads_table.c.email).where(
                 (leads_table.c.email == sender_email)
                 & (leads_table.c.chain_status == "active")
@@ -63,9 +63,9 @@ async def _process_sender(sender_email: str) -> bool:
     lead_id = lead.id
     logger.info("[task.imap] Chain stopped for lead_id=%d email=%s", lead_id, sender_email)
 
-    async with get_db() as conn:
+    with get_sync_session() as conn:
         # Stop the chain
-        await conn.execute(
+        conn.execute(
             update(leads_table)
             .where(leads_table.c.id == lead_id)
             .values(
@@ -76,7 +76,7 @@ async def _process_sender(sender_email: str) -> bool:
         )
 
         # Get pending email events
-        result = await conn.execute(
+        result = conn.execute(
             select(
                 email_events_table.c.id,
                 email_events_table.c.celery_task_id,
@@ -100,8 +100,8 @@ async def _process_sender(sender_email: str) -> bool:
     # Cancel all pending events in bulk
     if pending_events:
         event_ids = [e.id for e in pending_events]
-        async with get_db() as conn:
-            await conn.execute(
+        with get_sync_session() as conn:
+            conn.execute(
                 update(email_events_table)
                 .where(email_events_table.c.id.in_(event_ids))
                 .values(status="cancelled")
@@ -113,14 +113,14 @@ async def _process_sender(sender_email: str) -> bool:
     return True
 
 
-async def _log_poll(
+def _log_poll(
     polled_at: datetime,
     messages_checked: int,
     matches_found: int,
     error: str | None,
 ) -> None:
-    async with get_db() as conn:
-        await conn.execute(
+    with get_sync_session() as conn:
+        conn.execute(
             insert(imap_poll_log_table).values(
                 polled_at=polled_at,
                 messages_checked=messages_checked,

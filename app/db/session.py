@@ -1,6 +1,7 @@
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
+import sqlalchemy as sa
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -40,3 +41,21 @@ async def get_db():
     except Exception as exc:
         logger.error("[db] Connection failure: %s", exc, exc_info=True)
         raise
+
+
+@contextmanager
+def get_sync_session():
+    """Synchronous DB context manager for Celery tasks.
+
+    Creates a fresh SQLite engine+connection each time to avoid sharing the
+    module-level AsyncEngine across event loops. aiosqlite does not support
+    use from a different event loop than the one that created the engine, so
+    Celery tasks (which call asyncio.run() per task) must use this instead.
+    """
+    sync_url = settings.DATABASE_URL.replace("+aiosqlite", "")
+    sync_engine = sa.create_engine(sync_url)
+    try:
+        with sync_engine.begin() as conn:
+            yield conn
+    finally:
+        sync_engine.dispose()

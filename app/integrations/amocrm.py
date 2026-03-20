@@ -79,8 +79,9 @@ class AmoCRMClient:
         """Refresh AmoCRM OAuth2 access token with file-based cross-process lock."""
         lock_path = "/data/amocrm_tokens.lock"
         loop = asyncio.get_event_loop()
-        lock_file = open(lock_path, "w")  # noqa: WPS515
+        lock_file = None
         try:
+            lock_file = open(lock_path, "w")  # noqa: WPS515
             # Acquire exclusive file lock — blocks other processes until released.
             # Runs in executor to avoid blocking the async event loop.
             await loop.run_in_executor(
@@ -142,8 +143,9 @@ class AmoCRMClient:
             logger.error("[amocrm] OAuth2 token refresh failed: %s", exc, exc_info=True)
             raise
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
+            if lock_file is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
 
     async def find_contact_by_email(self, email: str) -> Optional[int]:
         """Search AmoCRM contacts by email. Returns contact_id or None."""

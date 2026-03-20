@@ -5,7 +5,7 @@ from sqlalchemy import select, update
 
 from app.celery_app import celery_app
 from app.db.models import leads_table
-from app.db.session import get_db
+from app.db.session import get_sync_session
 from app.integrations.amocrm import AmoCRMClient
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ def create_amocrm_deal(self, lead_id: int) -> None:
     """Create AmoCRM contact + deal for the given lead_id."""
     logger.info("[task.amocrm] Starting create_amocrm_deal: lead_id=%d", lead_id)
     try:
-        asyncio.run(_create_amocrm_deal_async(lead_id))
+        _create_amocrm_deal(lead_id)
     except Exception as exc:
         n = self.request.retries
         if n < self.max_retries:
@@ -25,14 +25,15 @@ def create_amocrm_deal(self, lead_id: int) -> None:
             raise self.retry(exc=exc, countdown=countdown)
         # Final failure — update DB
         logger.error("[task.amocrm] Failed after all retries: lead_id=%d error=%s", lead_id, exc, exc_info=True)
-        asyncio.run(_mark_amocrm_failed(lead_id))
+        _mark_amocrm_failed(lead_id)
         raise
 
 
-async def _create_amocrm_deal_async(lead_id: int) -> None:
-    """Async implementation of the AmoCRM deal creation flow."""
-    async with get_db() as conn:
-        result = await conn.execute(
+def _create_amocrm_deal(lead_id: int) -> None:
+    """Sync wrapper: reads lead from DB, runs async AmoCRM HTTP calls, writes result."""
+    # DB read (sync)
+    with get_sync_session() as conn:
+        result = conn.execute(
             select(
                 leads_table.c.name,
                 leads_table.c.email,
@@ -44,19 +45,12 @@ async def _create_amocrm_deal_async(lead_id: int) -> None:
     if not lead:
         raise ValueError(f"Lead not found: lead_id={lead_id}")
 
-    client = AmoCRMClient()
-    try:
-        contact_id = await client.find_contact_by_email(lead.email)
-        if contact_id is None:
-            contact_id = await client.create_contact(lead.name, lead.email, lead.phone)
+    # AmoCRM HTTP calls (async — asyncio.run creates a fresh event loop per task)
+    contact_id, deal_id = asyncio.run(_amocrm_http_async(lead))
 
-        deal_id = await client.create_deal(lead.name)
-        await client.link_contact_to_deal(deal_id, contact_id)
-    finally:
-        await client.close()
-
-    async with get_db() as conn:
-        await conn.execute(
+    # DB write (sync)
+    with get_sync_session() as conn:
+        conn.execute(
             update(leads_table)
             .where(leads_table.c.id == lead_id)
             .values(
@@ -72,10 +66,26 @@ async def _create_amocrm_deal_async(lead_id: int) -> None:
     )
 
 
-async def _mark_amocrm_failed(lead_id: int) -> None:
-    async with get_db() as conn:
-        await conn.execute(
+async def _amocrm_http_async(lead) -> tuple[int, int]:
+    """Async AmoCRM API calls — find/create contact and deal."""
+    client = AmoCRMClient()
+    try:
+        contact_id = await client.find_contact_by_email(lead.email)
+        if contact_id is None:
+            contact_id = await client.create_contact(lead.name, lead.email, lead.phone)
+
+        deal_id = await client.create_deal(lead.name)
+        await client.link_contact_to_deal(deal_id, contact_id)
+        return contact_id, deal_id
+    finally:
+        await client.close()
+
+
+def _mark_amocrm_failed(lead_id: int) -> None:
+    with get_sync_session() as conn:
+        conn.execute(
             update(leads_table)
             .where(leads_table.c.id == lead_id)
             .values(amocrm_status="failed")
         )
+

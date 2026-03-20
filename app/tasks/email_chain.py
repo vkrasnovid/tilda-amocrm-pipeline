@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import insert, select, text, update
@@ -7,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.celery_app import celery_app
 from app.db.models import email_events_table, leads_table
-from app.db.session import get_db
+from app.db.session import get_sync_session
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,10 @@ _STEP_COUNTDOWNS = {1: 0, 2: 172800, 3: 432000}  # 0, 48h, 120h
 def schedule_email_chain(lead_id: int) -> None:
     """Insert email_events rows and schedule the three send_email tasks."""
     logger.info("[task.email_chain] Scheduling 3 emails for lead_id=%d", lead_id)
-    asyncio.run(_schedule_email_chain_async(lead_id))
+    _schedule_email_chain(lead_id)
 
 
-async def _schedule_email_chain_async(lead_id: int) -> None:
+def _schedule_email_chain(lead_id: int) -> None:
     now = datetime.now(timezone.utc)
     scheduled_ats = {
         1: now,
@@ -35,9 +36,9 @@ async def _schedule_email_chain_async(lead_id: int) -> None:
 
         # BUG-001 fix: Insert the DB row BEFORE dispatching the Celery task so that
         # the worker cannot execute send_email before the row exists.
-        async with get_db() as conn:
+        with get_sync_session() as conn:
             try:
-                await conn.execute(
+                conn.execute(
                     insert(email_events_table).values(
                         lead_id=lead_id,
                         step=step,
@@ -69,8 +70,8 @@ async def _schedule_email_chain_async(lead_id: int) -> None:
         task_id = task.id
 
         # Store the task_id on the row for later revocation.
-        async with get_db() as conn:
-            await conn.execute(
+        with get_sync_session() as conn:
+            conn.execute(
                 update(email_events_table)
                 .where(
                     (email_events_table.c.lead_id == lead_id)
@@ -89,12 +90,12 @@ def send_email(self, lead_id: int, step: int) -> None:
     """Fetch lead, render email template, send via SMTP, update event status."""
     logger.info("[task.send_email] Starting: lead_id=%d step=%d", lead_id, step)
     try:
-        asyncio.run(_send_email_async(lead_id, step))
+        _send_email_sync(lead_id, step)
     except Exception as exc:
         n = self.request.retries
         if n < self.max_retries:
             # Reset the event to "pending" so the next retry attempt can claim it.
-            asyncio.run(_reset_email_pending(lead_id, step))
+            _reset_email_pending(lead_id, step)
             countdown = 30 * (3 ** n)  # 30s, 90s, 270s
             logger.warning(
                 "[task.send_email] Retry %d/3 for lead_id=%d step=%d: %s",
@@ -105,16 +106,14 @@ def send_email(self, lead_id: int, step: int) -> None:
             "[task.send_email] Failed after all retries: lead_id=%d step=%d error=%s",
             lead_id, step, exc, exc_info=True,
         )
-        asyncio.run(_mark_email_failed(lead_id, step, str(exc), self.max_retries))
+        _mark_email_failed(lead_id, step, str(exc), self.max_retries)
         raise
 
 
-async def _send_email_async(lead_id: int, step: int) -> None:
-    from app.integrations.smtp import send_html_email  # noqa: PLC0415
-
-    async with get_db() as conn:
-        # Check lead is still active
-        result = await conn.execute(
+def _send_email_sync(lead_id: int, step: int) -> None:
+    # 1. Check lead is still active (sync DB)
+    with get_sync_session() as conn:
+        result = conn.execute(
             select(
                 leads_table.c.name,
                 leads_table.c.email,
@@ -132,10 +131,9 @@ async def _send_email_async(lead_id: int, step: int) -> None:
         return
 
     # BUG-009 fix: atomically claim the event by transitioning pending -> sending.
-    # If the row is already cancelled/sent/sending (e.g. revoked or duplicate task),
-    # rowcount will be 0 and we skip — preventing TOCTOU duplicate sends.
-    async with get_db() as conn:
-        result = await conn.execute(
+    # If the row is already cancelled/sent/sending, rowcount will be 0 — skip.
+    with get_sync_session() as conn:
+        result = conn.execute(
             update(email_events_table)
             .where(
                 (email_events_table.c.lead_id == lead_id)
@@ -155,7 +153,6 @@ async def _send_email_async(lead_id: int, step: int) -> None:
 
     # Load and render template
     from jinja2 import Environment, FileSystemLoader, select_autoescape  # noqa: PLC0415
-    import os  # noqa: PLC0415
 
     templates_dir = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
     env = Environment(
@@ -172,15 +169,12 @@ async def _send_email_async(lead_id: int, step: int) -> None:
     }
     subject = subject_map.get(step, f"Письмо {step}")
 
-    await send_html_email(
-        to_email=lead.email,
-        to_name=lead.name,
-        subject=subject,
-        html_body=html_body,
-    )
+    # Send email via async SMTP (asyncio.run creates a fresh event loop per call)
+    asyncio.run(_send_html_email_async(lead.email, lead.name, subject, html_body))
 
-    async with get_db() as conn:
-        await conn.execute(
+    # Update event status to sent (sync DB)
+    with get_sync_session() as conn:
+        conn.execute(
             update(email_events_table)
             .where(
                 (email_events_table.c.lead_id == lead_id)
@@ -192,10 +186,23 @@ async def _send_email_async(lead_id: int, step: int) -> None:
     logger.info("[task.send_email] Sent step=%d to email=%s", step, lead.email)
 
 
-async def _reset_email_pending(lead_id: int, step: int) -> None:
+async def _send_html_email_async(
+    to_email: str, to_name: str, subject: str, html_body: str
+) -> None:
+    from app.integrations.smtp import send_html_email  # noqa: PLC0415
+
+    await send_html_email(
+        to_email=to_email,
+        to_name=to_name,
+        subject=subject,
+        html_body=html_body,
+    )
+
+
+def _reset_email_pending(lead_id: int, step: int) -> None:
     """Reset event status from 'sending' back to 'pending' before a retry."""
-    async with get_db() as conn:
-        await conn.execute(
+    with get_sync_session() as conn:
+        conn.execute(
             update(email_events_table)
             .where(
                 (email_events_table.c.lead_id == lead_id)
@@ -206,9 +213,9 @@ async def _reset_email_pending(lead_id: int, step: int) -> None:
         )
 
 
-async def _mark_email_failed(lead_id: int, step: int, error: str, retry_count: int) -> None:
-    async with get_db() as conn:
-        await conn.execute(
+def _mark_email_failed(lead_id: int, step: int, error: str, retry_count: int) -> None:
+    with get_sync_session() as conn:
+        conn.execute(
             update(email_events_table)
             .where(
                 (email_events_table.c.lead_id == lead_id)

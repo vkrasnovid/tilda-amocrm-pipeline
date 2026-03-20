@@ -21,9 +21,12 @@ async def upsert_lead(conn: AsyncConnection, payload: TildaWebhookPayload) -> tu
 
     BUG-004 fix: uses INSERT OR IGNORE to avoid a SELECT-then-INSERT race that
     crashes with IntegrityError when two concurrent webhooks arrive for the same email.
+    NEW-A fix: uses rowcount (not lastrowid) to detect new rows. lastrowid is
+    unreliable on reused pool connections after INSERT OR IGNORE is ignored.
+    Re-activation is checked explicitly via chain_status from SELECT.
     """
     # Atomic INSERT OR IGNORE — safe for concurrent requests on the same email.
-    result = await conn.execute(
+    insert_result = await conn.execute(
         insert(leads_table).prefix_with("OR IGNORE").values(
             email=payload.email,
             name=payload.name,
@@ -31,10 +34,19 @@ async def upsert_lead(conn: AsyncConnection, payload: TildaWebhookPayload) -> tu
             source_form_id=payload.formid,
         )
     )
-    is_new = bool(result.lastrowid)
+    is_new = insert_result.rowcount > 0
+
+    # Always SELECT to get lead_id and current chain_status.
+    result = await conn.execute(
+        select(leads_table.c.id, leads_table.c.chain_status).where(
+            leads_table.c.email == payload.email
+        )
+    )
+    lead_row = result.fetchone()
+    lead_id = lead_row.id
 
     if not is_new:
-        # Re-activate existing lead
+        # Existing lead: explicitly re-activate regardless of previous chain_status.
         await conn.execute(
             update(leads_table)
             .where(leads_table.c.email == payload.email)
@@ -47,11 +59,6 @@ async def upsert_lead(conn: AsyncConnection, payload: TildaWebhookPayload) -> tu
         )
         logger.warning("[webhook] Duplicate lead re-activated: email=%s", payload.email)
 
-    # Fetch lead_id (works for both new inserts and existing rows).
-    result = await conn.execute(
-        select(leads_table.c.id).where(leads_table.c.email == payload.email)
-    )
-    lead_id = result.scalar()
     return lead_id, is_new
 
 

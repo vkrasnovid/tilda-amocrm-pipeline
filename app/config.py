@@ -1,6 +1,7 @@
 import logging
 import logging.config
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,6 +58,18 @@ class Settings(BaseSettings):
     # Telegram
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_MANAGER_CHAT_ID: int = 0
+
+    @model_validator(mode="after")
+    def _reject_insecure_defaults(self) -> "Settings":
+        _SENTINEL = "change-me"
+        for field in ("TILDA_WEBHOOK_SECRET", "ADMIN_API_TOKEN"):
+            value = getattr(self, field)
+            if not value or value == _SENTINEL:
+                raise ValueError(
+                    f"{field} must be set to a non-empty value that is not '{_SENTINEL}'. "
+                    "Set it via the environment variable or .env file."
+                )
+        return self
 
 
 settings = Settings()
