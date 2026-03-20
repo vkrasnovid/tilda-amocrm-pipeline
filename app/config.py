@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM_NAME: str = "Company Name"
     SMTP_FROM_EMAIL: str = "noreply@example.com"
-    SMTP_USE_TLS: bool = True
+    SMTP_MODE: str = "starttls"  # "starttls" (port 587), "ssl" (port 465), "plain" (port 25)
 
     # IMAP
     IMAP_HOST: str = "imap.example.com"
@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 _NON_SECRET_KEYS = [
     "APP_HOST", "APP_PORT", "LOG_LEVEL", "DATABASE_URL", "REDIS_URL",
     "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", "SMTP_HOST", "SMTP_PORT",
-    "SMTP_FROM_EMAIL", "SMTP_FROM_NAME", "SMTP_USE_TLS", "IMAP_HOST",
+    "SMTP_FROM_EMAIL", "SMTP_FROM_NAME", "SMTP_MODE", "IMAP_HOST",
     "IMAP_PORT", "IMAP_MAILBOX", "IMAP_POLL_INTERVAL_SECONDS",
     "AMOCRM_BASE_URL", "AMOCRM_PIPELINE_ID", "AMOCRM_STAGE_ID",
     "TELEGRAM_MANAGER_CHAT_ID",

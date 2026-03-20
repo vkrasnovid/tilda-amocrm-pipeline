@@ -33,7 +33,33 @@ async def _schedule_email_chain_async(lead_id: int) -> None:
     for step, countdown in _STEP_COUNTDOWNS.items():
         scheduled_at = scheduled_ats[step]
 
-        # Schedule the send_email Celery task
+        # BUG-001 fix: Insert the DB row BEFORE dispatching the Celery task so that
+        # the worker cannot execute send_email before the row exists.
+        async with get_db() as conn:
+            try:
+                await conn.execute(
+                    insert(email_events_table).values(
+                        lead_id=lead_id,
+                        step=step,
+                        celery_task_id=None,  # updated after dispatch below
+                        status="pending",
+                        scheduled_at=scheduled_at,
+                    )
+                )
+                logger.debug(
+                    "[task.email_chain] Inserted email_event: step=%d scheduled_at=%s",
+                    step, scheduled_at.isoformat(),
+                )
+            except IntegrityError:
+                # Unique constraint on (lead_id, step) — row already exists (e.g. step was
+                # already sent from a previous chain). Skip dispatching for this step.
+                logger.warning(
+                    "[task.email_chain] Duplicate schedule skipped for lead_id=%d step=%d",
+                    lead_id, step,
+                )
+                continue
+
+        # Dispatch Celery task now that the DB row is committed.
         task = celery_app.send_task(
             "send_email",
             args=[lead_id, step],
@@ -42,28 +68,20 @@ async def _schedule_email_chain_async(lead_id: int) -> None:
         )
         task_id = task.id
 
-        # Insert email_event row with INSERT OR IGNORE for idempotency
+        # Store the task_id on the row for later revocation.
         async with get_db() as conn:
-            try:
-                await conn.execute(
-                    insert(email_events_table).values(
-                        lead_id=lead_id,
-                        step=step,
-                        celery_task_id=task_id,
-                        status="pending",
-                        scheduled_at=scheduled_at,
-                    )
+            await conn.execute(
+                update(email_events_table)
+                .where(
+                    (email_events_table.c.lead_id == lead_id)
+                    & (email_events_table.c.step == step)
                 )
-                logger.debug(
-                    "[task.email_chain] Inserted email_event: step=%d scheduled_at=%s task_id=%s",
-                    step, scheduled_at.isoformat(), task_id,
-                )
-            except IntegrityError:
-                # Unique constraint on (lead_id, step) — duplicate, skip
-                logger.warning(
-                    "[task.email_chain] Duplicate schedule skipped for lead_id=%d step=%d",
-                    lead_id, step,
-                )
+                .values(celery_task_id=task_id)
+            )
+        logger.debug(
+            "[task.email_chain] Dispatched send_email: step=%d task_id=%s",
+            step, task_id,
+        )
 
 
 @celery_app.task(bind=True, queue="email", max_retries=3, name="send_email")
@@ -75,6 +93,8 @@ def send_email(self, lead_id: int, step: int) -> None:
     except Exception as exc:
         n = self.request.retries
         if n < self.max_retries:
+            # Reset the event to "pending" so the next retry attempt can claim it.
+            asyncio.run(_reset_email_pending(lead_id, step))
             countdown = 30 * (3 ** n)  # 30s, 90s, 270s
             logger.warning(
                 "[task.send_email] Retry %d/3 for lead_id=%d step=%d: %s",
@@ -111,19 +131,24 @@ async def _send_email_async(lead_id: int, step: int) -> None:
         )
         return
 
+    # BUG-009 fix: atomically claim the event by transitioning pending -> sending.
+    # If the row is already cancelled/sent/sending (e.g. revoked or duplicate task),
+    # rowcount will be 0 and we skip — preventing TOCTOU duplicate sends.
     async with get_db() as conn:
-        # Check email event is not cancelled
         result = await conn.execute(
-            select(email_events_table.c.status).where(
+            update(email_events_table)
+            .where(
                 (email_events_table.c.lead_id == lead_id)
                 & (email_events_table.c.step == step)
+                & (email_events_table.c.status == "pending")
             )
+            .values(status="sending")
         )
-        event = result.fetchone()
+        claimed = result.rowcount > 0
 
-    if not event or event.status == "cancelled":
+    if not claimed:
         logger.debug(
-            "[task.send_email] Email event cancelled/missing, skipping: lead_id=%d step=%d",
+            "[task.send_email] Event not claimable (cancelled/sent/missing): lead_id=%d step=%d",
             lead_id, step,
         )
         return
@@ -165,6 +190,20 @@ async def _send_email_async(lead_id: int, step: int) -> None:
         )
 
     logger.info("[task.send_email] Sent step=%d to email=%s", step, lead.email)
+
+
+async def _reset_email_pending(lead_id: int, step: int) -> None:
+    """Reset event status from 'sending' back to 'pending' before a retry."""
+    async with get_db() as conn:
+        await conn.execute(
+            update(email_events_table)
+            .where(
+                (email_events_table.c.lead_id == lead_id)
+                & (email_events_table.c.step == step)
+                & (email_events_table.c.status == "sending")
+            )
+            .values(status="pending")
+        )
 
 
 async def _mark_email_failed(lead_id: int, step: int, error: str, retry_count: int) -> None:

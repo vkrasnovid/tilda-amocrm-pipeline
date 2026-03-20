@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import logging
 from typing import Optional
 
@@ -75,29 +76,74 @@ class AmoCRMClient:
         raise RuntimeError("Unreachable: retry loop exhausted without raising")
 
     async def _refresh_access_token(self) -> None:
-        """Refresh AmoCRM OAuth2 access token."""
+        """Refresh AmoCRM OAuth2 access token with file-based cross-process lock."""
+        lock_path = "/data/amocrm_tokens.lock"
+        loop = asyncio.get_event_loop()
+        lock_file = open(lock_path, "w")  # noqa: WPS515
         try:
-            resp = await self._client.post(
-                f"{settings.AMOCRM_BASE_URL}/oauth2/access_token",
-                json={
-                    "client_id": settings.AMOCRM_CLIENT_ID,
-                    "client_secret": settings.AMOCRM_CLIENT_SECRET,
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                    "redirect_uri": settings.AMOCRM_REDIRECT_URI,
-                },
+            # Acquire exclusive file lock — blocks other processes until released.
+            # Runs in executor to avoid blocking the async event loop.
+            await loop.run_in_executor(
+                None, lambda: fcntl.flock(lock_file, fcntl.LOCK_EX)
             )
-            resp.raise_for_status()
+
+            # Re-read tokens: another process may have already refreshed while we waited.
+            current = load_tokens()
+            if current.get("access_token") and current["access_token"] != self._access_token:
+                logger.info("[amocrm] Token already refreshed by another process, adopting new tokens")
+                self._access_token = current["access_token"]
+                self._refresh_token = current["refresh_token"]
+                self._client.headers["Authorization"] = f"Bearer {self._access_token}"
+                return
+
+            # Perform token refresh with retry on 5xx / network errors.
+            resp = None
+            for attempt in range(_MAX_RETRIES + 1):
+                try:
+                    resp = await self._client.post(
+                        "/oauth2/access_token",
+                        json={
+                            "client_id": settings.AMOCRM_CLIENT_ID,
+                            "client_secret": settings.AMOCRM_CLIENT_SECRET,
+                            "grant_type": "refresh_token",
+                            "refresh_token": self._refresh_token,
+                            "redirect_uri": settings.AMOCRM_REDIRECT_URI,
+                        },
+                    )
+                    if resp.status_code >= 500 and attempt < _MAX_RETRIES:
+                        delay = _RETRY_DELAYS[attempt]
+                        logger.warning(
+                            "[amocrm] Token refresh 5xx (status=%d), retry %d/%d (sleeping %ds)",
+                            resp.status_code, attempt + 1, _MAX_RETRIES, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    resp.raise_for_status()
+                    break
+                except (httpx.NetworkError, httpx.TimeoutException) as exc:
+                    if attempt < _MAX_RETRIES:
+                        delay = _RETRY_DELAYS[attempt]
+                        logger.warning(
+                            "[amocrm] Token refresh network error, retry %d/%d: %s (sleeping %ds)",
+                            attempt + 1, _MAX_RETRIES, exc, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.error("[amocrm] OAuth2 token refresh failed after retries: %s", exc, exc_info=True)
+                    raise
+
             data = resp.json()
             self._access_token = data["access_token"]
             self._refresh_token = data["refresh_token"]
             save_tokens(self._access_token, self._refresh_token)
-            # Update Authorization header on the client
             self._client.headers["Authorization"] = f"Bearer {self._access_token}"
-            logger.info("[amocrm] Access token refreshed, new expiry stored to token file")
+            logger.info("[amocrm] Access token refreshed, new tokens stored")
         except Exception as exc:
             logger.error("[amocrm] OAuth2 token refresh failed: %s", exc, exc_info=True)
             raise
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
 
     async def find_contact_by_email(self, email: str) -> Optional[int]:
         """Search AmoCRM contacts by email. Returns contact_id or None."""

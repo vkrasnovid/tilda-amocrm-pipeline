@@ -91,7 +91,7 @@ async def _process_sender(sender_email: str) -> bool:
     # Revoke pending Celery tasks
     for event in pending_events:
         if event.celery_task_id:
-            celery_app.control.revoke(event.celery_task_id, terminate=False)
+            celery_app.control.revoke(event.celery_task_id, terminate=True)
             logger.debug(
                 "[task.imap] Revoked celery task %s for email_event step=%d",
                 event.celery_task_id, event.step,

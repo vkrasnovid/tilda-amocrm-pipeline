@@ -16,8 +16,15 @@ COPY ./app /app/app
 COPY ./templates /app/templates
 COPY ./alembic /app/alembic
 COPY alembic.ini /app/alembic.ini
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN adduser --disabled-password --no-create-home appuser
-USER appuser
+# Install gosu for privilege drop in entrypoint, then create appuser.
+# The entrypoint runs as root, creates /data with correct ownership, then execs as appuser.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --no-create-home appuser \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 # CMD is overridden per-service in docker-compose.yml

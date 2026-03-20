@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import settings
@@ -11,6 +12,14 @@ engine = create_async_engine(
     settings.DATABASE_URL,
     echo=(settings.LOG_LEVEL.upper() == "DEBUG"),
 )
+
+
+@event.listens_for(engine.sync_engine, "connect")
+def _set_wal_mode(dbapi_connection, connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+
 
 logger.debug(
     "[db] Engine created: dialect=%s url=%s",

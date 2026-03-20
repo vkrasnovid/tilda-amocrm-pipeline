@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from app.db.models import email_events_table, leads_table
 from app.db.session import get_db
+from app.limiter import limiter
 from app.schemas import EmailEventOut, LeadDetailOut, LeadOut
 from app.security import verify_admin_token
 
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+@limiter.limit("60/minute")
 @router.get("/leads", response_model=List[LeadOut], dependencies=[Depends(verify_admin_token)])
 async def list_leads(
     request: Request,
@@ -42,8 +44,9 @@ async def list_leads(
     return [LeadOut(**dict(row._mapping)) for row in rows]
 
 
+@limiter.limit("60/minute")
 @router.get("/leads/{lead_id}", response_model=LeadDetailOut, dependencies=[Depends(verify_admin_token)])
-async def get_lead(lead_id: int) -> LeadDetailOut:
+async def get_lead(request: Request, lead_id: int) -> LeadDetailOut:
     """Get a single lead with all its email events."""
     async with get_db() as conn:
         result = await conn.execute(

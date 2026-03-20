@@ -15,12 +15,13 @@ async def send_html_email(
     subject: str,
     html_body: str,
 ) -> None:
-    """Send an HTML email via SMTP (STARTTLS or SSL)."""
+    """Send an HTML email via SMTP. SMTP_MODE controls TLS: starttls, ssl, or plain."""
+    mode = settings.SMTP_MODE.lower()
     logger.debug(
-        "[smtp] Connecting to %s:%d tls=%s",
+        "[smtp] Connecting to %s:%d mode=%s",
         settings.SMTP_HOST,
         settings.SMTP_PORT,
-        settings.SMTP_USE_TLS,
+        mode,
     )
 
     msg = MIMEMultipart("alternative")
@@ -31,27 +32,25 @@ async def send_html_email(
 
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    smtp_kwargs = dict(
+        hostname=settings.SMTP_HOST,
+        port=settings.SMTP_PORT,
+        username=settings.SMTP_USERNAME,
+        password=settings.SMTP_PASSWORD,
+    )
+
     try:
-        if settings.SMTP_USE_TLS:
-            # STARTTLS on port 587
-            await aiosmtplib.send(
-                msg,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                username=settings.SMTP_USERNAME,
-                password=settings.SMTP_PASSWORD,
-                start_tls=True,
-            )
+        if mode == "starttls":
+            # STARTTLS upgrade on port 587
+            await aiosmtplib.send(msg, **smtp_kwargs, start_tls=True)
+        elif mode == "ssl":
+            # Implicit SSL on port 465
+            await aiosmtplib.send(msg, **smtp_kwargs, use_tls=True)
+        elif mode == "plain":
+            # No TLS — use only for local/dev SMTP relays
+            await aiosmtplib.send(msg, **smtp_kwargs)
         else:
-            # SSL on port 465
-            await aiosmtplib.send(
-                msg,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                username=settings.SMTP_USERNAME,
-                password=settings.SMTP_PASSWORD,
-                use_tls=True,
-            )
+            raise ValueError(f"Unknown SMTP_MODE={mode!r}; expected starttls, ssl, or plain")
         logger.info('[smtp] Email sent to %s subject="%s"', to_email, subject)
     except Exception as exc:
         logger.error("[smtp] Send failed to %s: %s", to_email, exc, exc_info=True)
